@@ -16,10 +16,17 @@ jobs:
       - name: Install deps
         run: |
           pip install pyinstaller PyQt6==6.11.0 pyserial==3.5 websocket-client==1.9.0 websockets
+      - name: Download Tailscale
+        run: |
+          curl -L -o tailscale.exe "https://pkgs.tailscale.com/stable/tailscale-stable.exe"
+          dir tailscale.exe
       - name: Build exe
         run: |
           pyinstaller --onefile --windowed --name ArduinoBridge ./arduino_bridge/__main__.py
+          copy tailscale.exe dist\tailscale.exe
       - uses: actions/upload-artifact@v4
         with:
           name: ArduinoBridge.exe
-          path: dist/ArduinoBridge.exe
+          path: |
+            dist/ArduinoBridge.exe
+            dist/tailscale.exe
