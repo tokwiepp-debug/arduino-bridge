@@ -156,10 +156,21 @@ class WSServerWorker(QThread):
             logger.info(f"Melissa Command-Verbindung: {addr_str}")
             self.melissa_connected.emit(addr_str)
 
+            # Send ack to Melissa immediately
+            try:
+                await ws.send(json.dumps({"type": "ack", "status": "connected", "tool": "arduino-bridge"}))
+            except Exception:
+                pass
+
             try:
                 async for raw_msg in ws:
                     try:
                         data = json.loads(raw_msg)
+                        # Send ack for each message
+                        try:
+                            await ws.send(json.dumps({"type": "ack", "received": data.get("type", "?")}))
+                        except Exception:
+                            pass
                         self.message_received.emit(data)
                     except json.JSONDecodeError:
                         pass
