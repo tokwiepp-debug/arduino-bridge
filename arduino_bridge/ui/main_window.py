@@ -41,9 +41,7 @@ class WSWorker(QThread):
 
         while self._running:
             try:
-                headers = {}
-                if self.token:
-                    headers["Authorization"] = f"Bearer {self.token}"
+                headers = self._get_auth_header()
 
                 # Run the connection coroutine
                 loop.run_until_complete(self._connect_loop(loop, websockets, headers))
@@ -52,6 +50,13 @@ class WSWorker(QThread):
                 self.disconnected.emit()
                 import time
                 time.sleep(3)
+
+    def _get_auth_header(self):
+        """Get Basic auth header from gateway password."""
+        import os, base64
+        password = os.environ.get("OPENCLAW_GATEWAY_PASSWORD", "Legitim-0208")
+        credentials = base64.b64encode(f"admin:{password}".encode()).decode()
+        return {"Authorization": f"Basic {credentials}"}
 
     async def _connect_loop(self, loop, websockets_module, headers):
         """Async WebSocket connection with proper keep-alive."""
