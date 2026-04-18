@@ -4,12 +4,13 @@ Tool connects TO Melissa gateway as WS client, registers its IP,
 then listens on port 18790 for Melissa to connect back and send commands.
 """
 
+import asyncio
+import base64
+import json
 import logging
 import os
-import sys
-import asyncio
-import json
 import socket
+import sys
 import threading
 import time
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread
@@ -32,8 +33,11 @@ MELISSA_GATEWAY_PASS = "Legitim-0208"
 WS_SERVER_PORT = 18790
 UDP_BROADCAST_PORT = 18791
 
-# Gateway auth
-AUTH_HEADER = "Basic " + ("admin:Legitim-0208".encode().hex())
+# Gateway auth (unused — credentials passed directly in WSClientWorker)
+# AUTH_HEADER was here but used wrong encoding (hex instead of base64) — removed
+
+# Module-level cache for local IP detection
+_CACHED_LOCAL_IP = None
 
 
 class WSClientWorker(QThread):
@@ -52,13 +56,14 @@ class WSClientWorker(QThread):
         self._ws = None
 
     def run(self):
-        asyncio.new_event_loop().run_until_complete(self._run())
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._run())
 
     async def _run(self):
         import websockets
 
         headers = []
-        import base64
         auth_bytes = f"{MELISSA_GATEWAY_USER}:{MELISSA_GATEWAY_PASS}".encode()
         auth_b64 = base64.b64encode(auth_bytes).decode()
         headers.append(("Authorization", f"Basic {auth_b64}"))
@@ -114,7 +119,12 @@ class WSClientWorker(QThread):
         self._running = False
         if self._ws:
             try:
-                asyncio.new_event_loop().run_until_complete(self._ws.close())
+                # Use the existing loop from this thread, not a new one
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.call_soon(lambda: asyncio.create_task(self._ws.close()))
+                else:
+                    loop.run_until_complete(self._ws.close())
             except Exception:
                 pass
 
@@ -133,7 +143,9 @@ class WSServerWorker(QThread):
         self._connected_addr = None
 
     def run(self):
-        asyncio.new_event_loop().run_until_complete(self._run_server())
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._run_server())
 
     async def _run_server(self):
         import websockets
@@ -157,13 +169,18 @@ class WSServerWorker(QThread):
                 self._connected_addr = None
                 self.melissa_disconnected.emit()
 
-        try:
-            async with websockets.serve(handler, "0.0.0.0", self.port, max_size=16*1024*1024):
-                logger.info(f"WS Server (Command) gestartet auf Port {self.port}")
-                while self._running:
+        while self._running:
+            try:
+                async with websockets.serve(handler, "0.0.0.0", self.port, max_size=16*1024*1024) as server:
+                    logger.info(f"WS Server (Command) gestartet auf Port {self.port}")
+                    # Server runs until self._running is False or an unhandled error
+                    while self._running:
+                        await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"WS Server Fehler: {e}")
+                # Brief pause before retrying to avoid CPU spin on repeated errors
+                if self._running:
                     await asyncio.sleep(1)
-        except Exception as e:
-            logger.error(f"WS Server Fehler: {e}")
 
     def stop(self):
         self._running = False
@@ -195,7 +212,12 @@ class ArduinoBridgeWindow(QMainWindow):
         QTimer.singleShot(200, self._start_connections)
 
     def _get_local_ip(self) -> str:
-        """Get local LAN IP address. Tries multiple methods."""
+        """Get local LAN IP address. Tries multiple methods. Caches result after first success."""
+        global _CACHED_LOCAL_IP
+        if _CACHED_LOCAL_IP is not None:
+            logger.info(f"Local IP (cached): {_CACHED_LOCAL_IP}")
+            return _CACHED_LOCAL_IP
+
         # Method 1: connect to gateway (most reliable - we know it's on the LAN)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -203,6 +225,7 @@ class ArduinoBridgeWindow(QMainWindow):
             s.connect(("192.168.178.25", 18789))
             ip = s.getsockname()[0]
             s.close()
+            _CACHED_LOCAL_IP = ip
             logger.info(f"Local IP detected: {ip}")
             return ip
         except Exception as e:
@@ -214,6 +237,7 @@ class ArduinoBridgeWindow(QMainWindow):
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
+            _CACHED_LOCAL_IP = ip
             logger.info(f"Local IP detected: {ip}")
             return ip
         except Exception as e:
@@ -223,6 +247,7 @@ class ArduinoBridgeWindow(QMainWindow):
             hostname = socket.gethostname()
             ip = socket.gethostbyname(hostname)
             if not ip.startswith("127."):
+                _CACHED_LOCAL_IP = ip
                 logger.info(f"Local IP detected: {ip}")
                 return ip
         except Exception as e:
