@@ -14,33 +14,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install deps
-        run: |
-          pip install pyinstaller PyQt6==6.11.0 pyserial==3.5 websocket-client==1.9.0 websockets
-      - name: Download Tailscale
-        run: |
-          powershell -Command "
-            $ProgressPreference = 'SilentlyContinue'
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup.exe'
-            Write-Host 'Downloading Tailscale from:'$url
-            try {
-              Invoke-WebRequest -Uri $url -OutFile 'tailscale-setup.exe' -UseBasicParsing -TimeoutSec 30
-              Write-Host 'Download OK - Size:' (Get-Item 'tailscale-setup.exe').Length
-            } catch {
-              Write-Host 'Download failed, trying alternate URL...'
-              $url2 = 'https://tailscale.com/stable/tailscale-setup.exe'
-              Invoke-WebRequest -Uri $url2 -OutFile 'tailscale-setup.exe' -UseBasicParsing -TimeoutSec 30
-            }
-          "
-          dir tailscale-setup.exe
+        run: pip install pyinstaller PyQt6==6.11.0 pyserial==3.5 websocket-client==1.9.0 websockets
       - name: Build exe
-        run: |
-          pyinstaller --onefile --windowed --name ArduinoBridge ./arduino_bridge/__main__.py
-          copy tailscale-setup.exe dist\ /y
-          dir dist
+        run: pyinstaller --onefile --windowed --name ArduinoBridge ./arduino_bridge/__main__.py
       - uses: actions/upload-artifact@v4
         with:
           name: ArduinoBridge.exe
-          path: |
-            dist/ArduinoBridge.exe
-            dist/tailscale-setup.exe
+          path: dist/ArduinoBridge.exe
