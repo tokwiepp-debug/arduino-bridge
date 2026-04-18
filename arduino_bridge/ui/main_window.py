@@ -24,109 +24,13 @@ from ..core import PortScanner, BoardDetector
 
 logger = logging.getLogger("arduino_bridge.main_window")
 
-# Melissa gateway address
-MELISSA_GATEWAY_URL = "ws://192.168.178.25:18789"
-MELISSA_GATEWAY_USER = "admin"
-MELISSA_GATEWAY_PASS = "Legitim-0208"
 
-# Local ports
+# Local port
 WS_SERVER_PORT = 18790
-UDP_BROADCAST_PORT = 18791
 
-# Gateway auth (unused — credentials passed directly in WSClientWorker)
-# AUTH_HEADER was here but used wrong encoding (hex instead of base64) — removed
 
 # Module-level cache for local IP detection
 _CACHED_LOCAL_IP = None
-
-
-class WSClientWorker(QThread):
-    """Background thread: connects as WebSocket CLIENT to Melissa gateway and registers this tool."""
-    connected = pyqtSignal(str)      # Emits gateway URL on success
-    disconnected = pyqtSignal()
-    registration_failed = pyqtSignal(str)
-
-    def __init__(self, gateway_url: str, local_ip: str, ws_port: int = WS_SERVER_PORT):
-        super().__init__()
-        self.gateway_url = gateway_url
-        self.local_ip = local_ip
-        self.ws_port = ws_port
-        self._running = True
-        self.daemon = True
-        self._ws = None
-
-    def run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._run())
-
-    async def _run(self):
-        import websockets
-
-        headers = []
-        auth_bytes = f"{MELISSA_GATEWAY_USER}:{MELISSA_GATEWAY_PASS}".encode()
-        auth_b64 = base64.b64encode(auth_bytes).decode()
-        headers.append(("Authorization", f"Basic {auth_b64}"))
-
-        while self._running:
-            try:
-                async with websockets.connect(self.gateway_url, extra_headers=headers, max_size=16*1024*1024) as ws:
-                    self._ws = ws
-                    logger.info(f"Verbunden mit Melissa Gateway: {self.gateway_url}")
-                    self.connected.emit(self.gateway_url)
-
-                    # Send registration message
-                    register_msg = {
-                        "type": "register",
-                        "tool": "arduino-bridge",
-                        "ip": self.local_ip,
-                        "ws_port": self.ws_port,
-                        "version": "1.0.0",
-                        "capabilities": ["flash"]
-                    }
-                    await ws.send(json.dumps(register_msg))
-                    logger.info(f"Registration gesendet: {register_msg}")
-
-                    # Keep connection alive, receive any messages from gateway
-                    while self._running:
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                            # Gateway might send pings or other messages
-                            try:
-                                data = json.loads(msg)
-                                if data.get("type") == "pong":
-                                    logger.debug("Pong empfangen")
-                            except json.JSONDecodeError:
-                                pass
-                        except asyncio.TimeoutError:
-                            # Send ping to keep alive
-                            try:
-                                await ws.send(json.dumps({"type": "ping"}))
-                            except Exception:
-                                break
-            except Exception as e:
-                logger.warning(f"WS Client getrennt: {e}")
-                self._ws = None
-                self.disconnected.emit()
-
-            # Retry after 5 seconds
-            for _ in range(50):
-                if not self._running:
-                    break
-                time.sleep(0.1)
-
-    def stop(self):
-        self._running = False
-        if self._ws:
-            try:
-                # Use the existing loop from this thread, not a new one
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.call_soon(lambda: asyncio.create_task(self._ws.close()))
-                else:
-                    loop.run_until_complete(self._ws.close())
-            except Exception:
-                pass
 
 
 class WSServerWorker(QThread):
@@ -210,7 +114,6 @@ class ArduinoBridgeWindow(QMainWindow):
         self._last_ports = []
 
         # Connection workers
-        self._ws_client: WSClientWorker | None = None
         self._ws_server: WSServerWorker | None = None
 
         # Get local IP
@@ -276,21 +179,8 @@ class ArduinoBridgeWindow(QMainWindow):
         self._ws_server.start()
         self.log("[INFO]", f"WS Server (Command) gestartet auf Port {WS_SERVER_PORT}")
 
-        # Start WS client — connects TO Melissa gateway to register our IP
-        self._ws_client = WSClientWorker(MELISSA_GATEWAY_URL, self._local_ip, WS_SERVER_PORT)
-        self._ws_client.connected.connect(self._on_melissa_registered)
-        self._ws_client.disconnected.connect(self._on_melissa_disconnected)
-        self._ws_client.start()
-        self.log("[INFO]", f"WS Client → Melissa Gateway: {MELISSA_GATEWAY_URL}")
 
-    def _on_melissa_registered(self, gateway_url: str):
-        self._melissa_registered = True
-        self.conn_label.setText("Melissa Gateway: ✅ Registriert")
-        self.conn_label.setStyleSheet("color: #10B981; font-weight: bold;")
-        self.melissa_status_label.setText(f"Verbunden mit Melissa Gateway")
-        self.melissa_status_label.setStyleSheet("color: #10B981;")
-        self.status_bar.showMessage(f"Verbunden mit Melissa Gateway — Eigene IP: {self._local_ip}", 10000)
-        self.log("[SYSTEM]", f"Bei Melissa Gateway registriert (IP: {self._local_ip}, Port: {WS_SERVER_PORT})")
+
 
     def _on_melissa_connected(self, addr: str):
         self.conn_label.setText(f"Melissa: ● Verbunden ({addr})")
@@ -299,25 +189,10 @@ class ArduinoBridgeWindow(QMainWindow):
         self.log("[SYSTEM]", f"Melissa verbunden (Command): {addr}")
 
     def _on_melissa_disconnected(self):
-        self._melissa_registered = False
-        self.conn_label.setText("Melissa Gateway: ○ Nicht verbunden")
+        self.conn_label.setText("Melissa: ○ Getrennt")
         self.conn_label.setStyleSheet("color: #A0A0B0; font-weight: bold;")
-        self.melissa_status_label.setText("Nicht verbunden — starte neu...")
-        self.melissa_status_label.setStyleSheet("color: #A0A0B0;")
-        self.log("[WARN]", "Melissa getrennt — versuche neu...")
+        self.log("[WARN]", "Melissa getrennt — warte auf neue Verbindung...")
 
-        # Restart WS client after delay
-        QTimer.singleShot(5000, self._restart_client)
-
-    def _restart_client(self):
-        if self._ws_client:
-            self._ws_client.stop()
-            self._ws_client = None
-        self._ws_client = WSClientWorker(MELISSA_GATEWAY_URL, self._local_ip, WS_SERVER_PORT)
-        self._ws_client.connected.connect(self._on_melissa_registered)
-        self._ws_client.disconnected.connect(self._on_melissa_disconnected)
-        self._ws_client.start()
-        self.log("[INFO]", "WS Client neu gestartet")
 
     def _on_ws_message(self, data: dict):
         msg_type = data.get("type", "")
@@ -371,7 +246,7 @@ class ArduinoBridgeWindow(QMainWindow):
 
         self.restart_btn = QPushButton("🔄 Neu verbinden")
         self.restart_btn.setFixedWidth(130)
-        self.restart_btn.clicked.connect(self._restart_client)
+        self.restart_btn.clicked.connect(self._start_connections)
         melissa_layout.addRow("", self.restart_btn)
 
         layout.addWidget(melissa_group)
@@ -503,7 +378,6 @@ class ArduinoBridgeWindow(QMainWindow):
         QMessageBox.about(self, UI_STRINGS["menu_about"],
             f"ArduinoBridge v1.0.0\n\n"
             f"Melissa Reverse Connection\n\n"
-            f"• Gateway: {MELISSA_GATEWAY_URL}\n"
             f"• Command-Port: {WS_SERVER_PORT}\n"
             f"• Eigene IP: {self._local_ip}\n\n"
             "Desktop-Tool für Arduino-Firmware-Flash\n\n"
@@ -619,9 +493,7 @@ class ArduinoBridgeWindow(QMainWindow):
     def closeEvent(self, event):
         if hasattr(self, '_auto_timer'):
             self._auto_timer.stop()
-        if self._ws_client:
-            self._ws_client.stop()
-            self._ws_client = None
+
         if self._ws_server:
             self._ws_server.stop()
             self._ws_server.wait(1000)
