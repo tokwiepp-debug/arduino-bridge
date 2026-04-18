@@ -1,6 +1,6 @@
 """
-Main Window — PROJ-4 + Melissa Connection + Manual Board Select
-ArduinoBridge main window with dark theme, Melissa WS connection, and manual board selection.
+Main Window — ArduinoBridge mit Melissa Reverse Connection
+ArduinoBridge main window with dark theme, Melissa WS connection (auto-scan), and manual board selection.
 """
 
 import logging
@@ -8,6 +8,10 @@ import os
 import sys
 import asyncio
 import json
+import socket
+import struct
+import threading
+import time
 from PyQt6.QtCore import QTimer, pyqtSignal, QThread
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
     QPushButton, QLabel, QLineEdit, QProgressBar, QTextEdit, QStatusBar,
@@ -49,14 +53,13 @@ class WSWorker(QThread):
             except Exception as e:
                 logger.warning(f"WS reconnect in 3s: {e}")
                 self.disconnected.emit()
-                import time
                 time.sleep(3)
 
     def _get_auth_header(self):
         """Get Basic auth header from gateway password."""
-        import os, base64
-        password = os.environ.get("OPENCLAW_GATEWAY_PASSWORD", "Legitim-0208")
-        credentials = base64.b64encode(f"admin:{password}".encode()).decode()
+        import base64
+        # Hardcoded credentials - same as OpenClaw gateway default
+        credentials = base64.b64encode(b"admin:Legitim-0208").decode()
         return {"Authorization": f"Basic {credentials}"}
 
     async def _connect_loop(self, loop, websockets_module, headers):
@@ -106,15 +109,15 @@ class ArduinoBridgeWindow(QMainWindow):
         self._ws_worker: WSWorker | None = None
         self._melissa_connected = False
 
-        # Load Melissa URL from environment or default
-        self._melissa_uri = os.environ.get("OPENCLAW_GATEWAY_URI", "ws://localhost:18789")
-        self._melissa_token = os.environ.get("OPENCLAW_TOKEN", "")
-        self._tailscale_ip = None
+        # Melissa gateway URI (will be auto-set by network scan)
+        self._melissa_uri = "ws://localhost:18789"
+        self._melissa_token = ""
 
         self._init_ui()
         self._init_menu()
         self._scan_ports()
         QTimer.singleShot(100, self._start_ws)
+        QTimer.singleShot(500, self._scan_for_melissa)
         QTimer.singleShot(0, self._start_auto_refresh)
 
     def _init_ui(self):
@@ -142,36 +145,6 @@ class ArduinoBridgeWindow(QMainWindow):
         self.connect_btn.clicked.connect(self._start_ws)
         conn_row.addWidget(self.connect_btn)
         layout.addLayout(conn_row)
-
-        # === Tailscale Section ===
-        tailscale_row = QHBoxLayout()
-        self.tailscale_status_label = QLabel("Tailscale: ○ Getrennt")
-        self.tailscale_status_label.setStyleSheet("color: #EF4444; font-weight: bold;")
-        tailscale_row.addWidget(self.tailscale_status_label)
-
-        tailscale_row.addWidget(QLabel("Auth Key:"))
-        self.tailscale_key_edit = QLineEdit()
-        self.tailscale_key_edit.setMaximumWidth(300)
-        self.tailscale_key_edit.setPlaceholderText("tskey-auth-kxxx...")
-        self.tailscale_key_edit.setStyleSheet("background-color: #3C3C4F; color: #E0E0E0; border: 1px solid #404050; padding: 2px 6px; font-size: 9pt;")
-        tailscale_row.addWidget(self.tailscale_key_edit)
-
-        self.tailscale_login_btn = QPushButton("🔑 Login")
-        self.tailscale_login_btn.setFixedWidth(80)
-        self.tailscale_login_btn.clicked.connect(self._tailscale_login)
-        tailscale_row.addWidget(self.tailscale_login_btn)
-
-        self.tailscale_logout_btn = QPushButton("Logout")
-        self.tailscale_logout_btn.setFixedWidth(80)
-        self.tailscale_logout_btn.setEnabled(False)
-        self.tailscale_logout_btn.clicked.connect(self._tailscale_logout)
-        tailscale_row.addWidget(self.tailscale_logout_btn)
-
-        self.tailscale_ip_label = QLabel("")
-        self.tailscale_ip_label.setStyleSheet("color: #A0A0B0; font-size: 9pt;")
-        tailscale_row.addWidget(self.tailscale_ip_label)
-        tailscale_row.addStretch()
-        layout.addLayout(tailscale_row)
 
         # === Row 2: Port Scanner ===
         toolbar = QToolBar()
@@ -289,19 +262,98 @@ class ArduinoBridgeWindow(QMainWindow):
     def _on_uri_changed(self, text):
         self._melissa_uri = text
 
+    def _scan_for_melissa(self):
+        """Scan local subnet for Melissa gateway on port 18789."""
+        def do_scan():
+            try:
+                # Get local IP and subnet
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+
+                # Calculate subnet
+                ip_parts = local_ip.split('.')
+                subnet_base = '.'.join(ip_parts[:3])
+                self.log("[INFO]", f"ScanneSubnetz {subnet_base}.x nach Melissa...")
+
+                found_ip = None
+                timeout = 0.5  # 500ms per host
+
+                for i in range(1, 255):
+                    if not hasattr(self, '_running') or not self._running:
+                        break
+                    target_ip = f"{subnet_base}.{i}"
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(timeout)
+                        result = sock.connect_ex((target_ip, 18789))
+                        sock.close()
+                        if result == 0:
+                            # Port is open - this is Melissa!
+                            found_ip = target_ip
+                            self.log("[INFO]", f"Melissa gefunden: {found_ip}")
+                            break
+                    except Exception:
+                        continue
+
+                if found_ip:
+                    uri = f"ws://{found_ip}:18789"
+                    # Update UI from main thread
+                    from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+                    QMetaObject.invokeMethod(self.uri_edit, "setText", Qt.QueuedConnection, Q_ARG(str, uri))
+                    self._melissa_uri = uri
+                else:
+                    self.log("[INFO]", "Melissa nicht im lokalen Subnetz gefunden")
+
+            except Exception as e:
+                self.log("[WARN]", f"Melissa-Scan fehlgeschlagen: {e}")
+
+        # Run scan in background thread
+        thread = threading.Thread(target=do_scan, daemon=True)
+        thread.start()
+
     def _start_ws(self):
         """Start WebSocket connection to Melissa."""
         if self._ws_worker:
             self._ws_worker.stop()
             self._ws_worker = None
-        self._ws_worker = WSWorker(self._get_ws_uri(), self._melissa_token)
+
+        # Use current URI from UI field
+        uri = self.uri_edit.text().strip() or self._melissa_uri
+        self._melissa_uri = uri
+
+        self._ws_worker = WSWorker(uri, self._melissa_token)
         self._ws_worker.connected.connect(self._on_ws_connected)
         self._ws_worker.disconnected.connect(self._on_ws_disconnected)
         self._ws_worker.message_received.connect(self._on_ws_message)
         self._ws_worker.start()
         self.conn_label.setText("Melissa: " + UI_STRINGS["melissa_connecting"])
         self.conn_label.setStyleSheet("color: #FFD700; font-weight: bold;")
-        self.log("[INFO]", "Verbinde mit Melissa...")
+        self.log("[INFO]", f"Verbinde mit Melissa: {uri}...")
+
+    def _send_register_message(self):
+        """Send 'register' message to Melissa so she knows this tool is online."""
+        if self._ws_worker and self._melissa_connected:
+            try:
+                import asyncio
+                import websockets
+                import base64
+
+                async def send_reg():
+                    headers = {"Authorization": f"Basic {base64.b64encode(b'admin:Legitim-0208').decode()}"}
+                    uri = self._melissa_uri
+                    async with websockets.connect(uri, extra_headers=headers) as ws:
+                        await ws.send(json.dumps({
+                            "type": "register",
+                            "name": "ArduinoBridge",
+                            "version": "1.0.0",
+                            "capabilities": ["flash"]
+                        }))
+
+                asyncio.run(send_reg())
+            except Exception as e:
+                logger.warning(f"Register message failed: {e}")
 
     def _on_ws_connected(self):
         self._melissa_connected = True
@@ -309,8 +361,8 @@ class ArduinoBridgeWindow(QMainWindow):
         self.conn_label.setStyleSheet("color: #10B981; font-weight: bold;")
         self.status_bar.showMessage("Melissa verbunden ✓", 5000)
         self.log("[SYSTEM]", "Melissa verbunden ✓")
-        # Notify Tobi via WhatsApp webhook
-        self._notify_tobi("🔌 ArduinoBridge ist jetzt mit Melissa verbunden!")
+        # Send register message so Melissa knows ArduinoBridge is online
+        threading.Thread(target=self._send_register_message, daemon=True).start()
 
     def _on_ws_disconnected(self):
         self._melissa_connected = False
@@ -332,112 +384,6 @@ class ArduinoBridgeWindow(QMainWindow):
             self.log("[DEBUG]", "Ping von Melissa")
         else:
             self.log("[MSG]", f"Unbekannt: {msg_type}")
-
-    def _notify_tobi(self, message: str):
-        """Send notification to Tobi via OpenClaw gateway."""
-        try:
-            # Read gateway config
-            config_path = os.path.expanduser("~/.openclaw/gateway.json")
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    cfg = json.load(f)
-                    whatsapp = cfg.get("whatsapp", {})
-                    if whatsapp.get("enabled"):
-                        # Use OpenClaw's internal notification via ws_manager
-                        pass
-        except Exception as e:
-            logger.error(f"Notify failed: {e}")
-
-    def _tailscale_login(self):
-        auth_key = self.tailscale_key_edit.text().strip()
-        if not auth_key:
-            self.log("[ERROR]", "Bitte Tailscale Auth Key eingeben")
-            return
-        self.log("[INFO]", "Tailscale Login...")
-        tailscale_path = self._get_tailscale_path()
-        if not tailscale_path:
-            self.log("[ERROR]", "Tailscale nicht gefunden")
-            return
-
-        import subprocess, threading
-        def run_tailscale():
-            try:
-                result = subprocess.run(
-                    [tailscale_path, "login", "--authkey", auth_key, "--hostname", "arduinobridge"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if result.returncode == 0:
-                    self._on_tailscale_connected()
-                else:
-                    self.log("[ERROR]", f"Tailscale Login fehlgeschlagen: {result.stderr}")
-            except Exception as e:
-                self.log("[ERROR]", f"Tailscale Fehler: {e}")
-
-        threading.Thread(target=run_tailscale, daemon=True).start()
-
-    def _tailscale_logout(self):
-        import subprocess, threading
-        def run_tailscale():
-            tailscale_path = self._get_tailscale_path()
-            if tailscale_path:
-                subprocess.run([tailscale_path, "logout"], capture_output=True)
-            self._on_tailscale_disconnected()
-
-        threading.Thread(target=run_tailscale, daemon=True).start()
-
-    def _get_tailscale_path(self) -> str | None:
-        """Find bundled tailscale.exe or system tailscale."""
-        import shutil
-        # Check bundled location (relative to exe)
-        if getattr(sys, 'frozen', False):
-            base_dir = os.path.dirname(sys.executable)
-            bundled = os.path.join(base_dir, "tailscale.exe")
-            if os.path.isfile(bundled):
-                return bundled
-        # Check system PATH
-        return shutil.which("tailscale") or shutil.which("tailscale.exe")
-
-    def _on_tailscale_connected(self):
-        """Get Tailscale IP and use it for WS."""
-        import subprocess, threading
-        def get_ip():
-            tailscale_path = self._get_tailscale_path()
-            if not tailscale_path:
-                return
-            try:
-                result = subprocess.run(
-                    [tailscale_path, "ip", "-4"],
-                    capture_output=True, text=True, timeout=10
-                )
-                if result.returncode == 0:
-                    ts_ip = result.stdout.strip()
-                    if ts_ip.startswith("100."):
-                        self._tailscale_ip = ts_ip
-                        self.tailscale_status_label.setText(f"Tailscale: ● {ts_ip}")
-                        self.tailscale_status_label.setStyleSheet("color: #10B981; font-weight: bold;")
-                        self.tailscale_ip_label.setText(f"→ WS: ws://{ts_ip}:18789")
-                        self.tailscale_logout_btn.setEnabled(True)
-                        self.tailscale_login_btn.setEnabled(False)
-                        self.log("[SYSTEM]", f"Tailscale verbunden: {ts_ip}")
-            except Exception as e:
-                self.log("[WARN]", f"Tailscale IP fehlgeschlagen: {e}")
-
-        threading.Thread(target=get_ip, daemon=True).start()
-
-    def _on_tailscale_disconnected(self):
-        self._tailscale_ip = None
-        self.tailscale_status_label.setText("Tailscale: ○ Getrennt")
-        self.tailscale_status_label.setStyleSheet("color: #EF4444; font-weight: bold;")
-        self.tailscale_ip_label.setText("")
-        self.tailscale_logout_btn.setEnabled(False)
-        self.tailscale_login_btn.setEnabled(True)
-        self.log("[INFO]", "Tailscale getrennt")
-
-    def _get_ws_uri(self) -> str:
-        """Get WebSocket URI preferring Tailscale IP."""
-        if hasattr(self, '_tailscale_ip') and self._tailscale_ip:
-            return f"ws://{self._tailscale_ip}:18789"
-        return self._melissa_uri
 
     def _flash_from_hex_string(self, hex_str: str, port: str, board: str):
         """Flash from raw HEX string (received from Melissa)."""
@@ -469,7 +415,7 @@ class ArduinoBridgeWindow(QMainWindow):
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.about(self, UI_STRINGS["menu_about"],
-            "ArduinoBridge v1.0.0\n\nDesktop-Tool für Arduino-Firmware-Flash\n\nMade with ❤️ for Tobi\n\nFeatures:\n• COM-Port-Scanner\n• Board Auto-Detection + Manual Override\n• Melissa WebSocket Verbindung\n• HEX-Flash per Datei oder Melissa")
+            "ArduinoBridge v1.0.0\n\nDesktop-Tool für Arduino-Firmware-Flash\n\nMade with ❤️ for Tobi\n\nFeatures:\n• COM-Port-Scanner\n• Board Auto-Detection + Manual Override\n• Melissa WebSocket Verbindung (Auto-Scan)\n• HEX-Flash per Datei oder Melissa")
 
     def _scan_ports(self):
         ports = self.scanner.scan()
