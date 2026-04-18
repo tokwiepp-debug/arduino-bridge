@@ -1,0 +1,9 @@
+{
+  "id": "hello",
+  "name": "Hello Sprut",
+  "version": "1.0.0",
+  "description": "Beispiel-Sprut der zeigt wie das Plugin-System funktioniert",
+  "author": "Tobi",
+  "enabled_by_default": true,
+  "entry": "sprut.py:SprutWidget"
+}
