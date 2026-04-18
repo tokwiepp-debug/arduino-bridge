@@ -15,7 +15,6 @@ from PyQt6.QtGui import QAction
 
 from .theme import DARK_STYLESHEET, UI_STRINGS
 from ..core import PortScanner, BoardDetector
-from ..ai.ws_manager import WsManager
 
 logger = logging.getLogger("arduino_bridge.main_window")
 
@@ -25,36 +24,63 @@ class WSWorker(QThread):
     disconnected = pyqtSignal()
     message_received = pyqtSignal(dict)
 
-    def __init__(self, uri, token):
+    def __init__(self, uri, token=None):
         super().__init__()
         self.uri = uri
         self.token = token
         self._running = True
+        self.daemon = True
 
     def run(self):
+        """Run WebSocket in a persistent asyncio event loop."""
+        import asyncio
         import websockets
-        asyncio.run(self._connect())
 
-    async def _connect(self):
-        import websockets
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         while self._running:
             try:
                 headers = {}
                 if self.token:
                     headers["Authorization"] = f"Bearer {self.token}"
-                async with websockets.connect(self.uri, extra_headers=headers or None) as ws:
-                    self.connected.emit()
-                    logger.info(f"Melissa verbunden: {self.uri}")
-                    async for msg in ws:
+
+                # Run the connection coroutine
+                loop.run_until_complete(self._connect_loop(loop, websockets, headers))
+            except Exception as e:
+                logger.warning(f"WS reconnect in 3s: {e}")
+                self.disconnected.emit()
+                import time
+                time.sleep(3)
+
+    async def _connect_loop(self, loop, websockets_module, headers):
+        """Async WebSocket connection with proper keep-alive."""
+        try:
+            async with websockets_module.connect(
+                self.uri,
+                extra_headers=headers or {}
+            ) as ws:
+                self.connected.emit()
+                logger.info(f"Verbunden: {self.uri}")
+
+                # Listen for messages until closed
+                while self._running:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                         try:
                             data = json.loads(msg)
                             self.message_received.emit(data)
                         except json.JSONDecodeError:
                             pass
-            except Exception as e:
-                logger.warning(f"Melissa getrennt, reconnect in 5s: {e}")
-                self.disconnected.emit()
-                await asyncio.sleep(5)
+                    except asyncio.TimeoutError:
+                        # Check if we're still running (keep-alive)
+                        continue
+                    except Exception as e:
+                        logger.warning(f"WS error: {e}")
+                        break
+        except Exception as e:
+            logger.warning(f"WS connection failed: {e}")
+            self.disconnected.emit()
 
     def stop(self):
         self._running = False
