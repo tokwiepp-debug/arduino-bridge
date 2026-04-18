@@ -195,14 +195,40 @@ class ArduinoBridgeWindow(QMainWindow):
         QTimer.singleShot(200, self._start_connections)
 
     def _get_local_ip(self) -> str:
+        """Get local LAN IP address. Tries multiple methods."""
+        # Method 1: connect to gateway (most reliable - we know it's on the LAN)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
+            s.connect(("192.168.178.25", 18789))
+            ip = s.getsockname()[0]
+            s.close()
+            logger.info(f"Local IP detected: {ip}")
+            return ip
+        except Exception as e:
+            logger.warning(f"Method 1 (gateway connect) failed: {e}")
+        # Method 2: connect to 8.8.8.8 (fallback)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
+            logger.info(f"Local IP detected: {ip}")
             return ip
-        except Exception:
-            return "unbekannt"
+        except Exception as e:
+            logger.warning(f"Method 2 (8.8.8.8) failed: {e}")
+        # Method 3: use hostname resolution
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if not ip.startswith("127."):
+                logger.info(f"Local IP detected: {ip}")
+                return ip
+        except Exception as e:
+            logger.warning(f"Method 3 (hostname) failed: {e}")
+        logger.error("Could not detect local IP - all methods failed")
+        return "unbekannt"
 
     def _start_connections(self):
         """Start WS client (to Melissa gateway) + WS server (for commands)."""
