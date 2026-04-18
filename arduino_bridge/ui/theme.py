@@ -128,10 +128,10 @@ UI_STRINGS = {
     "hwid_label": "HWID:",
     "select_hex": "HEX-Datei auswählen",
     "hex_filter": "HEX Files (*.hex);;All Files (*.*)",
-    "melissa_connected": "● Verbunden",
-    "melissa_disconnected": "○ Getrennt",
+    "melissa_connected": "● Verbunden mit Melissa Gateway",
+    "melissa_disconnected": "○ Nicht verbunden",
     "melissa_connecting": "⏳ Verbinde...",
-}
+    "melissa_section_title": "Melissa-Verbindung",}
 
 COLORS = {
     "background": "#1E1E2E",

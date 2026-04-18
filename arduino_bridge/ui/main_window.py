@@ -1,8 +1,7 @@
 """
 Main Window — ArduinoBridge mit Melissa Reverse Connection
-ArduinoBridge main window with dark theme.
-Tool starts WS SERVER on port 18790 and broadcasts UDP beacon on port 18791.
-Melissa (gateway) scans for beacons and connects to the WS server.
+Tool connects TO Melissa gateway as WS client, registers its IP,
+then listens on port 18790 for Melissa to connect back and send commands.
 """
 
 import logging
@@ -24,14 +23,105 @@ from ..core import PortScanner, BoardDetector
 
 logger = logging.getLogger("arduino_bridge.main_window")
 
-# Ports for reverse connection
-UDP_BROADCAST_PORT = 18791
+# Melissa gateway address
+MELISSA_GATEWAY_URL = "ws://192.168.178.25:18789"
+MELISSA_GATEWAY_USER = "admin"
+MELISSA_GATEWAY_PASS = "Legitim-0208"
+
+# Local ports
 WS_SERVER_PORT = 18790
+UDP_BROADCAST_PORT = 18791
+
+# Gateway auth
+AUTH_HEADER = "Basic " + ("admin:Legitim-0208".encode().hex())
+
+
+class WSClientWorker(QThread):
+    """Background thread: connects as WebSocket CLIENT to Melissa gateway and registers this tool."""
+    connected = pyqtSignal(str)      # Emits gateway URL on success
+    disconnected = pyqtSignal()
+    registration_failed = pyqtSignal(str)
+
+    def __init__(self, gateway_url: str, local_ip: str, ws_port: int = WS_SERVER_PORT):
+        super().__init__()
+        self.gateway_url = gateway_url
+        self.local_ip = local_ip
+        self.ws_port = ws_port
+        self._running = True
+        self.daemon = True
+        self._ws = None
+
+    def run(self):
+        asyncio.new_event_loop().run_until_complete(self._run())
+
+    async def _run(self):
+        import websockets
+
+        headers = []
+        import base64
+        auth_bytes = f"{MELISSA_GATEWAY_USER}:{MELISSA_GATEWAY_PASS}".encode()
+        auth_b64 = base64.b64encode(auth_bytes).decode()
+        headers.append(("Authorization", f"Basic {auth_b64}"))
+
+        while self._running:
+            try:
+                async with websockets.connect(self.gateway_url, extra_headers=headers, max_size=16*1024*1024) as ws:
+                    self._ws = ws
+                    logger.info(f"Verbunden mit Melissa Gateway: {self.gateway_url}")
+                    self.connected.emit(self.gateway_url)
+
+                    # Send registration message
+                    register_msg = {
+                        "type": "register",
+                        "tool": "arduino-bridge",
+                        "ip": self.local_ip,
+                        "ws_port": self.ws_port,
+                        "version": "1.0.0",
+                        "capabilities": ["flash"]
+                    }
+                    await ws.send(json.dumps(register_msg))
+                    logger.info(f"Registration gesendet: {register_msg}")
+
+                    # Keep connection alive, receive any messages from gateway
+                    while self._running:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                            # Gateway might send pings or other messages
+                            try:
+                                data = json.loads(msg)
+                                if data.get("type") == "pong":
+                                    logger.debug("Pong empfangen")
+                            except json.JSONDecodeError:
+                                pass
+                        except asyncio.TimeoutError:
+                            # Send ping to keep alive
+                            try:
+                                await ws.send(json.dumps({"type": "ping"}))
+                            except Exception:
+                                break
+            except Exception as e:
+                logger.warning(f"WS Client getrennt: {e}")
+                self._ws = None
+                self.disconnected.emit()
+
+            # Retry after 5 seconds
+            for _ in range(50):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+    def stop(self):
+        self._running = False
+        if self._ws:
+            try:
+                asyncio.new_event_loop().run_until_complete(self._ws.close())
+            except Exception:
+                pass
 
 
 class WSServerWorker(QThread):
-    """Background thread running a WebSocket SERVER that accepts connections from Melissa."""
-    melissa_connected = pyqtSignal(str)  # Emits IP:port of connected Melissa
+    """Background thread: WebSocket SERVER on port 18790 — waits for Melissa to connect and send commands."""
+    melissa_connected = pyqtSignal(str)   # Emits IP:port of connected Melissa
     melissa_disconnected = pyqtSignal()
     message_received = pyqtSignal(dict)
 
@@ -40,36 +130,20 @@ class WSServerWorker(QThread):
         self.port = port
         self._running = True
         self.daemon = True
-        self._connected_addr = None  # IP of connected Melissa
+        self._connected_addr = None
 
     def run(self):
-        """Run WebSocket server in asyncio event loop."""
-        import websockets
         asyncio.new_event_loop().run_until_complete(self._run_server())
 
     async def _run_server(self):
-        """WebSocket server: waits for Melissa to connect, then handles messages."""
         import websockets
 
         async def handler(ws):
-            # Get peer address
             self._connected_addr = ws.remote_address[0]
             addr_str = f"{self._connected_addr}:{ws.remote_address[1]}"
-            logger.info(f"Melissa verbunden: {addr_str}")
+            logger.info(f"Melissa Command-Verbindung: {addr_str}")
             self.melissa_connected.emit(addr_str)
 
-            # Send register message to Melissa
-            try:
-                await ws.send(json.dumps({
-                    "type": "register",
-                    "name": "ArduinoBridge",
-                    "version": "1.0.0",
-                    "capabilities": ["flash"]
-                }))
-            except Exception:
-                pass
-
-            # Listen for incoming messages
             try:
                 async for raw_msg in ws:
                     try:
@@ -84,62 +158,12 @@ class WSServerWorker(QThread):
                 self.melissa_disconnected.emit()
 
         try:
-            # Use serve() context manager for proper cleanup
-            async with websockets.serve(handler, "0.0.0.0", self.port, max_size=16 * 1024 * 1024):
-                logger.info(f"WS Server gestartet auf Port {self.port}")
+            async with websockets.serve(handler, "0.0.0.0", self.port, max_size=16*1024*1024):
+                logger.info(f"WS Server (Command) gestartet auf Port {self.port}")
                 while self._running:
                     await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"WS Server Fehler: {e}")
-
-    def stop(self):
-        self._running = False
-
-
-class UDPBroadcastWorker(QThread):
-    """Sends UDP broadcast beacons every 2 seconds announcing this tool's presence."""
-    def __init__(self, port: int = UDP_BROADCAST_PORT):
-        super().__init__()
-        self.port = port
-        self._running = True
-        self.daemon = True
-
-    def run(self):
-        import socket
-
-        # Get local IP
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            local_ip = "127.0.0.1"
-
-        broadcast_addr = ("<broadcast>", self.port)
-        beacon = json.dumps({
-            "type": "arduino-bridge",
-            "ip": local_ip,
-            "ws_port": WS_SERVER_PORT
-        }).encode()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        logger.info(f"UDP Broadcast gestartet auf Port {self.port} (IP: {local_ip})")
-
-        while self._running:
-            try:
-                sock.sendto(beacon, broadcast_addr)
-            except Exception:
-                pass
-            for _ in range(20):  # Sleep ~2 seconds between broadcasts
-                if not self._running:
-                    break
-                time.sleep(0.1)
-
-        sock.close()
 
     def stop(self):
         self._running = False
@@ -156,17 +180,19 @@ class ArduinoBridgeWindow(QMainWindow):
         self.detector = BoardDetector()
         self._flash_process = None
         self._last_ports = []
-        self._ws_server: WSServerWorker | None = None
-        self._udp_broadcast: UDPBroadcastWorker | None = None
-        self._melissa_addr: str | None = None
 
-        # Get local IP for display
+        # Connection workers
+        self._ws_client: WSClientWorker | None = None
+        self._ws_server: WSServerWorker | None = None
+
+        # Get local IP
         self._local_ip = self._get_local_ip()
+        self._melissa_registered = False
 
         self._init_ui()
         self._init_menu()
         self._scan_ports()
-        QTimer.singleShot(100, self._start_reverse_connection)
+        QTimer.singleShot(200, self._start_connections)
 
     def _get_local_ip(self) -> str:
         try:
@@ -178,183 +204,58 @@ class ArduinoBridgeWindow(QMainWindow):
         except Exception:
             return "unbekannt"
 
-    def _start_reverse_connection(self):
-        """Start WS server and UDP broadcast - Melissa will find us."""
-        # Start UDP broadcast
-        self._udp_broadcast = UDPBroadcastWorker(UDP_BROADCAST_PORT)
-        self._udp_broadcast.start()
-        self.log("[INFO]", f"UDP Broadcast gestartet auf Port {UDP_BROADCAST_PORT}")
-
-        # Start WS server
+    def _start_connections(self):
+        """Start WS client (to Melissa gateway) + WS server (for commands)."""
+        # Start WS server on 18790 — waits for Melissa to connect with commands
         self._ws_server = WSServerWorker(WS_SERVER_PORT)
         self._ws_server.melissa_connected.connect(self._on_melissa_connected)
         self._ws_server.melissa_disconnected.connect(self._on_melissa_disconnected)
         self._ws_server.message_received.connect(self._on_ws_message)
         self._ws_server.start()
-        self.log("[INFO]", f"WS Server gestartet auf Port {WS_SERVER_PORT}")
+        self.log("[INFO]", f"WS Server (Command) gestartet auf Port {WS_SERVER_PORT}")
 
-        # Update status with our IP
-        self.conn_label.setText(f"Melissa: warte auf Verbindung...")
-        self.conn_label.setStyleSheet("color: #A0A0B0; font-weight: bold;")
-        self.status_bar.showMessage(f"Eigene IP: {self._local_ip} — warte auf Melissa", 10000)
+        # Start WS client — connects TO Melissa gateway to register our IP
+        self._ws_client = WSClientWorker(MELISSA_GATEWAY_URL, self._local_ip, WS_SERVER_PORT)
+        self._ws_client.connected.connect(self._on_melissa_registered)
+        self._ws_client.disconnected.connect(self._on_melissa_disconnected)
+        self._ws_client.start()
+        self.log("[INFO]", f"WS Client → Melissa Gateway: {MELISSA_GATEWAY_URL}")
 
-    def _init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-
-        # === Row 1: Melissa Connection Status ===
-        conn_row = QHBoxLayout()
-        self.conn_label = QLabel("Melissa: warte auf Verbindung...")
-        self.conn_label.setStyleSheet("color: #A0A0B0; font-weight: bold;")
-        conn_row.addWidget(self.conn_label)
-        conn_row.addStretch()
-
-        # Show our IP
-        self.ip_label = QLabel(f"IP: —")
-        self.ip_label.setStyleSheet("color: #A0A0B0; font-size: 9pt;")
-        conn_row.addWidget(self.ip_label)
-
-        self.connect_btn = QPushButton("🔄 Neu starten")
-        self.connect_btn.setFixedWidth(100)
-        self.connect_btn.clicked.connect(self._restart_reverse_connection)
-        conn_row.addWidget(self.connect_btn)
-        layout.addLayout(conn_row)
-
-        # === Row 2: Port Scanner ===
-        toolbar = QToolBar()
-        self.addToolBar(toolbar)
-        self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(150)
-        self.refresh_btn = QPushButton(UI_STRINGS["refresh_btn"])
-        self.refresh_btn.setFixedWidth(100)
-        self.refresh_btn.clicked.connect(self._scan_ports)
-        self.auto_refresh_cb = QCheckBox(UI_STRINGS["auto_refresh_cb"])
-        toolbar.addWidget(QLabel(UI_STRINGS["port_label"]))
-        toolbar.addWidget(self.port_combo)
-        toolbar.addWidget(self.refresh_btn)
-        toolbar.addWidget(self.auto_refresh_cb)
-
-        # === Row 3: Board Info + Manual Selector ===
-        board_group = QGroupBox("Board")
-        board_layout = QFormLayout(board_group)
-
-        self.board_auto_label = QLabel(UI_STRINGS["board_unknown"])
-        self.board_auto_label.setStyleSheet("font-size: 12px; color: #A0A0B0;")
-        board_layout.addRow("Erkannt:", self.board_auto_label)
-
-        board_type_row = QHBoxLayout()
-        board_type_row.addWidget(QLabel("Manual:"))
-        self.board_manual_combo = QComboBox()
-        self.board_manual_combo.setMinimumWidth(200)
-        self._populate_manual_boards()
-        self.board_manual_combo.currentIndexChanged.connect(self._on_manual_board_changed)
-        board_type_row.addWidget(self.board_manual_combo)
-        board_type_row.addStretch()
-        board_layout.addRow(board_type_row)
-
-        self.board_flash_tool_label = QLabel("Flash-Tool: —")
-        self.board_flash_tool_label.setStyleSheet("color: #A0A0B0;")
-        board_layout.addRow("Flash-Tool:", self.board_flash_tool_label)
-
-        layout.addWidget(board_group)
-
-        # === Row 4: HEX File ===
-        firmware_layout = QHBoxLayout()
-        firmware_layout.addWidget(QLabel(UI_STRINGS["firmware_label"]))
-        self.hex_path_edit = QLineEdit()
-        self.hex_path_edit.setPlaceholderText(UI_STRINGS["select_hex"])
-        firmware_layout.addWidget(self.hex_path_edit)
-        self.browse_btn = QPushButton(UI_STRINGS["browse_btn"])
-        self.browse_btn.setFixedWidth(100)
-        self.browse_btn.clicked.connect(self._browse_hex)
-        firmware_layout.addWidget(self.browse_btn)
-        layout.addLayout(firmware_layout)
-
-        # === Row 5: Flash Buttons ===
-        btn_layout = QHBoxLayout()
-        self.flash_btn = QPushButton(UI_STRINGS["flash_btn"])
-        self.flash_btn.setFixedWidth(120)
-        self.flash_btn.clicked.connect(self._do_flash)
-        self.cancel_btn = QPushButton(UI_STRINGS["cancel_btn"])
-        self.cancel_btn.setFixedWidth(100)
-        self.cancel_btn.setEnabled(False)
-        btn_layout.addWidget(self.flash_btn)
-        btn_layout.addWidget(self.cancel_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        # === Row 6: Progress Bar ===
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
-        # === Row 7: Log ===
-        layout.addWidget(QLabel(UI_STRINGS["log_label"]))
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(120)
-        layout.addWidget(self.log_output)
-
-        # === Row 8: Status Bar ===
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage(UI_STRINGS["status_ready"])
-
-    def _populate_manual_boards(self):
-        """Fill manual board selector."""
-        boards = [
-            ("auto", "— Automatisch —"),
-            ("uno", "Arduino UNO (ATMega328P)"),
-            ("nano", "Arduino Nano (ATMega328P)"),
-            ("nano_old", "Arduino Nano Old (ATMega168)"),
-            ("mega", "Arduino Mega 2560"),
-            ("leonardo", "Arduino Leonardo"),
-            ("esp32", "ESP32 DevKit"),
-            ("esp32c3", "ESP32-C3"),
-            ("esp8266", "ESP8266 (NodeMCU)"),
-            ("rp2040", "Raspberry Pi Pico"),
-            ("unknown", "⚠ Unbekannt (manuell)"),
-        ]
-        for bid, bname in boards:
-            self.board_manual_combo.addItem(bname, bid)
-
-    def _on_manual_board_changed(self, idx):
-        bid = self.board_manual_combo.currentData()
-        if bid and bid != "auto":
-            tool_map = {"uno": "avrdude", "nano": "avrdude", "nano_old": "avrdude",
-                        "mega": "avrdude", "leonardo": "avrdude",
-                        "esp32": "esptool", "esp32c3": "esptool", "esp8266": "esptool",
-                        "rp2040": "avrdude", "unknown": "avrdude"}
-            tool = tool_map.get(bid, "avrdude")
-            self.board_flash_tool_label.setText(f"Flash-Tool: {tool}")
-            self.board_auto_label.setText(f"Manuell: {self.board_manual_combo.currentText()}")
-        else:
-            self.board_flash_tool_label.setText("Flash-Tool: —")
-            self._update_board_info()
-
-    def _restart_reverse_connection(self):
-        """Restart WS server and UDP broadcast."""
-        if self._ws_server:
-            self._ws_server.stop()
-            self._ws_server = None
-        if self._udp_broadcast:
-            self._udp_broadcast.stop()
-            self._udp_broadcast = None
-        self._start_reverse_connection()
+    def _on_melissa_registered(self, gateway_url: str):
+        self._melissa_registered = True
+        self.conn_label.setText("Melissa Gateway: ✅ Registriert")
+        self.conn_label.setStyleSheet("color: #10B981; font-weight: bold;")
+        self.melissa_status_label.setText(f"Verbunden mit Melissa Gateway")
+        self.melissa_status_label.setStyleSheet("color: #10B981;")
+        self.status_bar.showMessage(f"Verbunden mit Melissa Gateway — Eigene IP: {self._local_ip}", 10000)
+        self.log("[SYSTEM]", f"Bei Melissa Gateway registriert (IP: {self._local_ip}, Port: {WS_SERVER_PORT})")
 
     def _on_melissa_connected(self, addr: str):
-        self._melissa_addr = addr
-        self.conn_label.setText(f"Melissa: ● Verbunden mit {addr}")
+        self.conn_label.setText(f"Melissa: ● Verbunden ({addr})")
         self.conn_label.setStyleSheet("color: #10B981; font-weight: bold;")
-        self.status_bar.showMessage(f"Melissa verbunden ✓", 5000)
-        self.log("[SYSTEM]", f"Melissa verbunden: {addr}")
+        self.status_bar.showMessage(f"Melissa Command-Verbindung: {addr}", 5000)
+        self.log("[SYSTEM]", f"Melissa verbunden (Command): {addr}")
 
     def _on_melissa_disconnected(self):
-        self._melissa_addr = None
-        self.conn_label.setText("Melissa: warte auf Verbindung...")
+        self._melissa_registered = False
+        self.conn_label.setText("Melissa Gateway: ○ Nicht verbunden")
         self.conn_label.setStyleSheet("color: #A0A0B0; font-weight: bold;")
-        self.log("[WARN]", "Melissa getrennt — warte auf neue Verbindung...")
+        self.melissa_status_label.setText("Nicht verbunden — starte neu...")
+        self.melissa_status_label.setStyleSheet("color: #A0A0B0;")
+        self.log("[WARN]", "Melissa getrennt — versuche neu...")
+
+        # Restart WS client after delay
+        QTimer.singleShot(5000, self._restart_client)
+
+    def _restart_client(self):
+        if self._ws_client:
+            self._ws_client.stop()
+            self._ws_client = None
+        self._ws_client = WSClientWorker(MELISSA_GATEWAY_URL, self._local_ip, WS_SERVER_PORT)
+        self._ws_client.connected.connect(self._on_melissa_registered)
+        self._ws_client.disconnected.connect(self._on_melissa_disconnected)
+        self._ws_client.start()
+        self.log("[INFO]", "WS Client neu gestartet")
 
     def _on_ws_message(self, data: dict):
         msg_type = data.get("type", "")
@@ -385,6 +286,145 @@ class ArduinoBridgeWindow(QMainWindow):
         self.hex_path_edit.setText(path)
         self._do_flash()
 
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        # === Melissa-Verbindung Section ===
+        melissa_group = QGroupBox("Melissa-Verbindung")
+        melissa_layout = QFormLayout(melissa_group)
+
+        self.conn_label = QLabel("Melissa Gateway: ○ Nicht verbunden")
+        self.conn_label.setStyleSheet("color: #A0A0B0; font-weight: bold;")
+        melissa_layout.addRow("Status:", self.conn_label)
+
+        self.melissa_status_label = QLabel("Nicht verbunden")
+        self.melissa_status_label.setStyleSheet("color: #A0A0B0;")
+        melissa_layout.addRow("Verbindung:", self.melissa_status_label)
+
+        self.ip_info_label = QLabel(f"Eigene IP: {self._local_ip}  |  Command-Port: {WS_SERVER_PORT}")
+        self.ip_info_label.setStyleSheet("color: #A0A0B0; font-size: 9pt;")
+        melissa_layout.addRow("Info:", self.ip_info_label)
+
+        self.restart_btn = QPushButton("🔄 Neu verbinden")
+        self.restart_btn.setFixedWidth(130)
+        self.restart_btn.clicked.connect(self._restart_client)
+        melissa_layout.addRow("", self.restart_btn)
+
+        layout.addWidget(melissa_group)
+
+        # === Port Scanner Toolbar ===
+        toolbar = QToolBar()
+        self.addToolBar(toolbar)
+        self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(150)
+        self.refresh_btn = QPushButton(UI_STRINGS["refresh_btn"])
+        self.refresh_btn.setFixedWidth(100)
+        self.refresh_btn.clicked.connect(self._scan_ports)
+        self.auto_refresh_cb = QCheckBox(UI_STRINGS["auto_refresh_cb"])
+        toolbar.addWidget(QLabel(UI_STRINGS["port_label"]))
+        toolbar.addWidget(self.port_combo)
+        toolbar.addWidget(self.refresh_btn)
+        toolbar.addWidget(self.auto_refresh_cb)
+
+        # === Board Info + Manual Selector ===
+        board_group = QGroupBox("Board")
+        board_layout = QFormLayout(board_group)
+
+        self.board_auto_label = QLabel(UI_STRINGS["board_unknown"])
+        self.board_auto_label.setStyleSheet("font-size: 12px; color: #A0A0B0;")
+        board_layout.addRow("Erkannt:", self.board_auto_label)
+
+        board_type_row = QHBoxLayout()
+        board_type_row.addWidget(QLabel("Manual:"))
+        self.board_manual_combo = QComboBox()
+        self.board_manual_combo.setMinimumWidth(200)
+        self._populate_manual_boards()
+        self.board_manual_combo.currentIndexChanged.connect(self._on_manual_board_changed)
+        board_type_row.addWidget(self.board_manual_combo)
+        board_type_row.addStretch()
+        board_layout.addRow(board_type_row)
+
+        self.board_flash_tool_label = QLabel("Flash-Tool: —")
+        self.board_flash_tool_label.setStyleSheet("color: #A0A0B0;")
+        board_layout.addRow("Flash-Tool:", self.board_flash_tool_label)
+
+        layout.addWidget(board_group)
+
+        # === HEX File ===
+        firmware_layout = QHBoxLayout()
+        firmware_layout.addWidget(QLabel(UI_STRINGS["firmware_label"]))
+        self.hex_path_edit = QLineEdit()
+        self.hex_path_edit.setPlaceholderText(UI_STRINGS["select_hex"])
+        firmware_layout.addWidget(self.hex_path_edit)
+        self.browse_btn = QPushButton(UI_STRINGS["browse_btn"])
+        self.browse_btn.setFixedWidth(100)
+        self.browse_btn.clicked.connect(self._browse_hex)
+        firmware_layout.addWidget(self.browse_btn)
+        layout.addLayout(firmware_layout)
+
+        # === Flash Buttons ===
+        btn_layout = QHBoxLayout()
+        self.flash_btn = QPushButton(UI_STRINGS["flash_btn"])
+        self.flash_btn.setFixedWidth(120)
+        self.flash_btn.clicked.connect(self._do_flash)
+        self.cancel_btn = QPushButton(UI_STRINGS["cancel_btn"])
+        self.cancel_btn.setFixedWidth(100)
+        self.cancel_btn.setEnabled(False)
+        btn_layout.addWidget(self.flash_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # === Progress Bar ===
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        # === Log ===
+        layout.addWidget(QLabel(UI_STRINGS["log_label"]))
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(120)
+        layout.addWidget(self.log_output)
+
+        # === Status Bar ===
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage(UI_STRINGS["status_ready"])
+
+    def _populate_manual_boards(self):
+        boards = [
+            ("auto", "— Automatisch —"),
+            ("uno", "Arduino UNO (ATMega328P)"),
+            ("nano", "Arduino Nano (ATMega328P)"),
+            ("nano_old", "Arduino Nano Old (ATMega168)"),
+            ("mega", "Arduino Mega 2560"),
+            ("leonardo", "Arduino Leonardo"),
+            ("esp32", "ESP32 DevKit"),
+            ("esp32c3", "ESP32-C3"),
+            ("esp8266", "ESP8266 (NodeMCU)"),
+            ("rp2040", "Raspberry Pi Pico"),
+            ("unknown", "⚠ Unbekannt (manuell)"),
+        ]
+        for bid, bname in boards:
+            self.board_manual_combo.addItem(bname, bid)
+
+    def _on_manual_board_changed(self, idx):
+        bid = self.board_manual_combo.currentData()
+        if bid and bid != "auto":
+            tool_map = {"uno": "avrdude", "nano": "avrdude", "nano_old": "avrdude",
+                        "mega": "avrdude", "leonardo": "avrdude",
+                        "esp32": "esptool", "esp32c3": "esptool", "esp8266": "esptool",
+                        "rp2040": "avrdude", "unknown": "avrdude"}
+            tool = tool_map.get(bid, "avrdude")
+            self.board_flash_tool_label.setText(f"Flash-Tool: {tool}")
+            self.board_auto_label.setText(f"Manuell: {self.board_manual_combo.currentText()}")
+        else:
+            self.board_flash_tool_label.setText("Flash-Tool: —")
+            self._update_board_info()
+
     def _init_menu(self):
         menubar = self.menuBar()
         datei_menu = menubar.addMenu(UI_STRINGS["menu_file"])
@@ -399,9 +439,10 @@ class ArduinoBridgeWindow(QMainWindow):
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.about(self, UI_STRINGS["menu_about"],
-            f"ArduinoBridge v1.0.0\n\nReverse Connection Mode\n\n"
-            f"• WS Server Port: {WS_SERVER_PORT}\n"
-            f"• UDP Broadcast Port: {UDP_BROADCAST_PORT}\n"
+            f"ArduinoBridge v1.0.0\n\n"
+            f"Melissa Reverse Connection\n\n"
+            f"• Gateway: {MELISSA_GATEWAY_URL}\n"
+            f"• Command-Port: {WS_SERVER_PORT}\n"
             f"• Eigene IP: {self._local_ip}\n\n"
             "Desktop-Tool für Arduino-Firmware-Flash\n\n"
             "Made with ❤️ for Tobi")
@@ -443,11 +484,6 @@ class ArduinoBridgeWindow(QMainWindow):
                 self.board_manual_combo.blockSignals(False)
         else:
             self.board_auto_label.setText(f"⚠ Unbekanntes Board — {port_info.hwid}")
-
-    def _start_auto_refresh(self):
-        self._auto_timer = QTimer()
-        self._auto_timer.timeout.connect(self._scan_ports)
-        self._auto_timer.start(3000)
 
     def _browse_hex(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -521,10 +557,11 @@ class ArduinoBridgeWindow(QMainWindow):
     def closeEvent(self, event):
         if hasattr(self, '_auto_timer'):
             self._auto_timer.stop()
+        if self._ws_client:
+            self._ws_client.stop()
+            self._ws_client = None
         if self._ws_server:
             self._ws_server.stop()
             self._ws_server.wait(1000)
-        if self._udp_broadcast:
-            self._udp_broadcast.stop()
-            self._udp_broadcast.wait(1000)
+            self._ws_server = None
         event.accept()
