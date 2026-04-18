@@ -1,0 +1,25 @@
+name: Build ArduinoBridge
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          pip install pyinstaller PyQt6==6.11.0 pyserial==3.5 websocket-client==1.9.0 websockets
+      - name: Build exe
+        run: |
+          pyinstaller --onefile --windowed --name ArduinoBridge ./arduino_bridge/__main__.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArduinoBridge.exe
+          path: dist/ArduinoBridge.exe
